@@ -7,9 +7,6 @@ from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.models import Model, load_model
 from sklearn.metrics import roc_curve, auc, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
-import spektral
-from spektral.layers import GCNConv, GlobalSumPool
-from spektral.data import Dataset, Graph
 from skimage.segmentation import slic
 from skimage.feature import graycomatrix, graycoprops
 from skimage import io, color, filters, measure
@@ -18,128 +15,218 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-# Set your paths
-train_dir = r"D:\ED\braintumor\data\Training"
-test_dir = r"D:\ED\braintumor\data\Testing"
-model_save_path = "brain_tumor_gcnn_model.keras"
+
+# ---------------------------
+# Updated SimpleGCN class for dense adjacency matrices
+class SimpleGCN(layers.Layer):
+    def __init__(self, units, activation=None, **kwargs):
+        super(SimpleGCN, self).__init__(**kwargs)
+        self.units = units
+        self.activation = keras.activations.get(activation)
+
+    def build(self, input_shape):
+        # Input shapes: [node_features, adjacency]
+        node_feature_shape = input_shape[0]
+        self.kernel = self.add_weight(
+            shape=(node_feature_shape[-1], self.units),
+            initializer='glorot_uniform',
+            name='kernel'
+        )
+        self.bias = self.add_weight(
+            shape=(self.units,),
+            initializer='zeros',
+            name='bias'
+        )
+        self.built = True
+
+    def call(self, inputs):
+        # Unpack inputs: node features and dense adjacency matrix
+        x, a = inputs
+        a_dense = a  # already dense
+
+        # Add self-loops: a_dense shape (batch, nodes, nodes)
+        a_with_self = a_dense + tf.eye(tf.shape(a_dense)[1])
+
+        # Degree matrix and normalization
+        d = tf.reduce_sum(a_with_self, axis=2)  # shape (batch, nodes)
+        d_inv_sqrt = tf.pow(d, -0.5)
+        d_inv_sqrt = tf.where(tf.math.is_inf(d_inv_sqrt), tf.zeros_like(d_inv_sqrt), d_inv_sqrt)
+
+        batch_size = tf.shape(a_dense)[0]
+        max_nodes = tf.shape(a_dense)[1]
+        # Create batched diagonal matrices using scatter_nd
+        batch_indices = tf.repeat(tf.range(batch_size)[:, tf.newaxis], max_nodes, axis=1)
+        diag_indices = tf.reshape(tf.tile(tf.range(max_nodes)[tf.newaxis, :], [batch_size, 1]), [-1])
+        indices = tf.stack([
+            tf.reshape(batch_indices, [-1]),
+            diag_indices,
+            diag_indices
+        ], axis=1)
+        values = tf.reshape(d_inv_sqrt, [-1])
+        dense_shape = [batch_size, max_nodes, max_nodes]
+        d_inv_sqrt_matrix = tf.scatter_nd(indices, values, dense_shape)
+
+        a_norm = tf.matmul(tf.matmul(d_inv_sqrt_matrix, a_with_self), d_inv_sqrt_matrix)
+
+        # Graph convolution: A' * X * W
+        x = tf.matmul(a_norm, x)
+        output = tf.matmul(x, self.kernel) + self.bias
+
+        if self.activation is not None:
+            output = self.activation(output)
+        return output
+
+    def compute_output_shape(self, input_shape):
+        node_features_shape = input_shape[0]
+        return (node_features_shape[0], node_features_shape[1], self.units)
 
 
-# Improved function to create graph from image using superpixel segmentation
+# ---------------------------
+# Improved image_to_graph function with error handling
 def image_to_graph(image_path, n_segments=100, compactness=10):
-    # Load image
-    img = io.imread(image_path)
+    try:
+        img = io.imread(image_path)
 
-    # Resize to standard dimensions
-    img = tf.image.resize(img, (512, 512)).numpy().astype('uint8')
+        # Validate image dimensions
+        if len(img.shape) < 2:
+            print(f"Error: {image_path} has invalid dimensions {img.shape}")
+            return None, None, None
 
-    # Handle grayscale vs RGB
-    if len(img.shape) == 2 or (len(img.shape) == 3 and img.shape[2] == 1):  # Grayscale
-        # Convert to 3-channel for consistent processing
+        # Handle different image formats
         if len(img.shape) == 2:
-            img_3channel = np.stack([img, img, img], axis=-1)
-            gray_img = img / 255.0  # Normalize to [0,1]
-        else:  # Already 3D but single channel
-            img_3channel = np.concatenate([img, img, img], axis=2)
-            gray_img = img[:, :, 0] / 255.0
-    else:  # RGB
-        img_3channel = img
+            img = np.stack([img, img, img], axis=-1)
+        elif len(img.shape) == 3:
+            if img.shape[2] == 4:
+                img = img[:, :, :3]
+            elif img.shape[2] == 1:
+                img = np.concatenate([img, img, img], axis=2)
+        else:
+            print(f"Error: {image_path} has unexpected shape {img.shape}")
+            return None, None, None
+
+        # Check for valid image
+        if img.size == 0 or np.max(img) == np.min(img):
+            print(f"Error: {image_path} is empty or has no contrast")
+            return None, None, None
+
+        # Resize image
+        img = tf.image.resize(img, (512, 512)).numpy().astype('uint8')
         gray_img = color.rgb2gray(img)
+        mask = gray_img > 0.05  # exclude dark background
 
-    # Create a mask to exclude the background (assuming background is very dark)
-    mask = gray_img > 0.05  # Threshold to exclude pure black background
+        # Superpixel segmentation
+        segments = slic(img, n_segments=n_segments, compactness=compactness,
+                        start_label=0, mask=mask)
+        n_nodes = segments.max() + 1
+        if n_nodes < 2:
+            x_grid, y_grid = np.meshgrid(np.linspace(0, img.shape[1] - 1, 10, dtype=int),
+                                         np.linspace(0, img.shape[0] - 1, 10, dtype=int))
+            segments = np.zeros_like(gray_img, dtype=int)
+            segment_idx = 0
+            for i in range(9):
+                for j in range(9):
+                    x_min, x_max = x_grid[i, j], x_grid[i, j + 1]
+                    y_min, y_max = y_grid[i, j], y_grid[i + 1, j]
+                    segments[y_min:y_max, x_min:x_max] = segment_idx
+                    segment_idx += 1
+            n_nodes = segment_idx
 
-    # Apply superpixel segmentation on the masked area
-    segments = slic(img_3channel, n_segments=n_segments, compactness=compactness,
-                    start_label=0, mask=mask)
+        # Extract node features (12 features per node)
+        node_features = np.zeros((n_nodes, 12))
+        edges = filters.sobel(gray_img)
+        region_props = measure.regionprops(segments + 1, intensity_image=gray_img)
+        region_dict = {prop.label - 1: prop for prop in region_props}
 
-    # Extract features for each superpixel
-    n_nodes = segments.max() + 1
+        for i in range(n_nodes):
+            mask_seg = segments == i
+            if mask_seg.sum() > 0:
+                region = gray_img[mask_seg]
+                node_features[i, 0] = np.mean(region)
+                node_features[i, 1] = np.std(region) if len(region) > 1 else 0
+                node_features[i, 2] = np.max(region)
+                node_features[i, 3] = np.mean(edges[mask_seg])
+                if region.size > 25:
+                    flat_region = (region * 255).astype('uint8')
+                    try:
+                        sample_size = min(8, int(np.sqrt(region.size)))
+                        reshaped_region = flat_region.flatten()[:sample_size * sample_size].reshape(sample_size,
+                                                                                                    sample_size)
+                        if reshaped_region.size >= 4:
+                            glcm = graycomatrix(reshaped_region, [1], [0],
+                                                levels=min(256, reshaped_region.max() + 1),
+                                                symmetric=True, normed=True)
+                            node_features[i, 4] = graycoprops(glcm, 'contrast').mean()
+                            node_features[i, 5] = graycoprops(glcm, 'homogeneity').mean()
+                            node_features[i, 6] = graycoprops(glcm, 'energy').mean()
+                            node_features[i, 7] = graycoprops(glcm, 'correlation').mean()
+                            node_features[i, 8] = graycoprops(glcm, 'dissimilarity').mean()
+                    except Exception:
+                        node_features[i, 4:9] = 0
+                if i in region_dict:
+                    prop = region_dict[i]
+                    node_features[i, 9] = prop.area / mask_seg.size
+                    node_features[i, 10] = prop.perimeter / (np.sqrt(mask_seg.size) + 1e-8)
+                    node_features[i, 11] = prop.eccentricity
 
-    # Node features: expanded for medical imaging (12 features)
-    # - 3 intensity features (mean, std, max)
-    # - 6 texture features (GLCM)
-    # - 3 shape features (area, perimeter, eccentricity)
-    node_features = np.zeros((n_nodes, 12))
+        # Normalize features
+        for i in range(node_features.shape[1]):
+            col_max = np.max(node_features[:, i])
+            col_min = np.min(node_features[:, i])
+            if col_max > col_min:
+                node_features[:, i] = (node_features[:, i] - col_min) / (col_max - col_min + 1e-8)
 
-    # Calculate additional image enhancement for feature extraction
-    # Edge detection to highlight boundaries
-    edges = filters.sobel(gray_img)
+        # Create adjacency matrix based on superpixel neighbors
+        adjacency = np.zeros((n_nodes, n_nodes))
+        from scipy import ndimage
+        for i in range(n_nodes):
+            mask_seg = segments == i
+            if mask_seg.sum() > 0:
+                dilated = ndimage.binary_dilation(mask_seg, structure=np.ones((3, 3)))
+                overlapping = np.unique(segments[dilated & ~mask_seg])
+                for j in overlapping:
+                    if j != i and 0 <= j < n_nodes:
+                        adjacency[i, j] = adjacency[j, i] = 1
 
-    # Region properties for shape analysis
-    region_props = measure.regionprops(segments + 1, intensity_image=gray_img)
-    region_dict = {prop.label - 1: prop for prop in region_props}
-
-    for i in range(n_nodes):
-        mask = segments == i
-        if mask.sum() > 0:
-            # Region intensity statistics
-            region = gray_img[mask]
-            node_features[i, 0] = np.mean(region)  # Mean intensity
-            node_features[i, 1] = np.std(region)  # Std deviation of intensity
-            node_features[i, 2] = np.max(region)  # Max intensity
-
-            # Edge content (tumor boundaries often have strong edges)
-            node_features[i, 3] = np.mean(edges[mask])
-
-            # Texture features (GLCM properties)
-            if region.size > 1:
-                flat_region = (region * 255).astype('uint8')
-                try:
-                    # Reshape to 2D for GLCM if possible
-                    if region.size >= 64:  # Need reasonable size for texture
-                        reshaped_region = flat_region.flatten()[:64].reshape(8, 8)
-                        glcm = graycomatrix(reshaped_region, [1], [0, np.pi / 4, np.pi / 2, 3 * np.pi / 4],
-                                            levels=64, symmetric=True, normed=True)
-                        node_features[i, 4] = graycoprops(glcm, 'contrast').mean()
-                        node_features[i, 5] = graycoprops(glcm, 'homogeneity').mean()
-                        node_features[i, 6] = graycoprops(glcm, 'energy').mean()
-                        node_features[i, 7] = graycoprops(glcm, 'correlation').mean()
-                        node_features[i, 8] = graycoprops(glcm, 'dissimilarity').mean()
-                except:
-                    # If GLCM fails, use zeros for texture features
-                    node_features[i, 4:9] = 0
-
-            # Shape features if available from regionprops
-            if i in region_dict:
-                prop = region_dict[i]
-                node_features[i, 9] = prop.area / mask.size  # Normalized area
-                node_features[i, 10] = prop.perimeter / np.sqrt(mask.size)  # Normalized perimeter
-                node_features[i, 11] = prop.eccentricity  # Eccentricity
-
-    # Min-max normalize features column-wise
-    for i in range(node_features.shape[1]):
-        if np.max(node_features[:, i]) > np.min(node_features[:, i]):
-            node_features[:, i] = (node_features[:, i] - np.min(node_features[:, i])) / (
-                        np.max(node_features[:, i]) - np.min(node_features[:, i]))
-
-    # Create adjacency matrix based on superpixel neighbors
-    adjacency = np.zeros((n_nodes, n_nodes))
-
-    # Find neighboring superpixels - more comprehensive approach
-    dilated_segments = np.copy(segments)
-
-    # Enumerate all segments
-    for i in range(n_nodes):
-        # Create a mask for current segment
-        mask = segments == i
-        if mask.sum() > 0:
-            # Dilate the mask slightly to find neighbors
-            from scipy import ndimage
-            dilated = ndimage.binary_dilation(mask, structure=np.ones((3, 3)))
-            # Find which other segments this dilated mask overlaps with
-            overlapping = np.unique(segments[dilated & ~mask])
-            # Add edges to adjacency matrix
-            for j in overlapping:
-                if j != i and j >= 0 and j < n_nodes:  # Valid node index
-                    adjacency[i, j] = adjacency[j, i] = 1
-
-    # Create Spektral Graph object
-    return Graph(x=node_features, a=adjacency)
+        return node_features, adjacency, segments
+    except Exception as e:
+        print(f"Error processing {image_path}: {e}")
+        return None, None, None
 
 
-# Function to process directories and create graph datasets
+# ---------------------------
+# Build Graph CNN Model (using dense adjacency matrices)
+def build_gcnn_model(n_features):
+    node_features_input = keras.Input(shape=(None, n_features), name='node_features')
+    adjacency_input = keras.Input(shape=(None, None), name='adjacency', sparse=False)
+
+    x = SimpleGCN(64, activation='relu')([node_features_input, adjacency_input])
+    x = layers.BatchNormalization()(x)
+    x = SimpleGCN(64, activation='relu')([x, adjacency_input])
+    x = layers.BatchNormalization()(x)
+    x = SimpleGCN(32, activation='relu')([x, adjacency_input])
+    x = layers.BatchNormalization()(x)
+
+    x = tf.reduce_mean(x, axis=1)  # Global average pooling
+    x = layers.Dense(32, activation='relu')(x)
+    x = layers.Dropout(0.3)(x)
+    x = layers.Dense(16, activation='relu')(x)
+    x = layers.Dropout(0.2)(x)
+
+    output = layers.Dense(1, activation='sigmoid')(x)
+    model = Model(inputs=[node_features_input, adjacency_input], outputs=output)
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=0.001),
+        loss='binary_crossentropy',
+        metrics=['accuracy', keras.metrics.Precision(), keras.metrics.Recall(), keras.metrics.AUC()]
+    )
+    return model
+
+
+# ---------------------------
+# Create Graph Dataset from directory
 def create_graph_dataset(directory):
-    graph_list = []
+    graph_features = []
+    graph_adjacency = []
     labels = []
     file_paths = []
 
@@ -147,362 +234,219 @@ def create_graph_dataset(directory):
         class_dir = os.path.join(directory, class_name)
         if os.path.isdir(class_dir):
             label = 1 if class_name.lower() == "tumor" else 0
-
-            # Get all images for this class
             image_files = [f for f in os.listdir(class_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
             print(f"Processing {len(image_files)} images from {class_name}...")
-
+            successful = 0
+            failed = 0
             for img_file in image_files:
                 img_path = os.path.join(class_dir, img_file)
                 try:
-                    graph = image_to_graph(img_path)
-                    graph_list.append(graph)
-                    labels.append(label)
-                    file_paths.append(img_path)
+                    node_features, adjacency, segments = image_to_graph(img_path)
+                    if node_features is not None and adjacency is not None and segments is not None:
+                        graph_features.append(node_features)
+                        graph_adjacency.append(adjacency)
+                        labels.append(label)
+                        file_paths.append(img_path)
+                        successful += 1
+                    else:
+                        failed += 1
                 except Exception as e:
                     print(f"Error processing {img_path}: {e}")
-
-    return graph_list, np.array(labels), file_paths
-
-
-# Create a custom dataset class
-class BrainTumorDataset(Dataset):
-    def __init__(self, graphs, labels):
-        self.graphs = graphs
-        self.labels = labels
-        super().__init__()
-
-    def read(self):
-        return self.graphs
-
-    def __getitem__(self, index):
-        return self.graphs[index]
-
-    def __len__(self):
-        return len(self.graphs)
-
-
-# Build improved Graph CNN model with additional techniques for medical imaging
-def build_gcnn_model(n_features):
-    # Define model inputs
-    node_features = keras.Input(shape=(n_features,), name='node_features')
-    adjacency = keras.Input(shape=(None,), name='adjacency', sparse=True)
-
-    # Graph convolution layers with skip connections for better gradient flow
-    graph_conv_1 = GCNConv(64, activation='relu')([node_features, adjacency])
-    graph_conv_1_bn = layers.BatchNormalization()(graph_conv_1)
-
-    graph_conv_2 = GCNConv(64, activation='relu')([graph_conv_1_bn, adjacency])
-    graph_conv_2_bn = layers.BatchNormalization()(graph_conv_2)
-
-    # Residual connection
-    graph_conv_3 = GCNConv(32, activation='relu')([graph_conv_2_bn, adjacency])
-    graph_conv_3_bn = layers.BatchNormalization()(graph_conv_3)
-
-    # Global pooling - using both sum and max for better feature capture
-    pooled_sum = GlobalSumPool()(graph_conv_3_bn)
-
-    # Dense layers with dropout for regularization
-    dense_1 = layers.Dense(32, activation='relu')(pooled_sum)
-    dropout_1 = layers.Dropout(0.3)(dense_1)
-    dense_2 = layers.Dense(16, activation='relu')(dropout_1)
-    dropout_2 = layers.Dropout(0.2)(dense_2)
-
-    # Output layer
-    output = layers.Dense(1, activation='sigmoid')(dropout_2)
-
-    # Create model
-    model = Model(inputs=[node_features, adjacency], outputs=output)
-
-    # Compile with appropriate metrics
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=0.001),
-        loss='binary_crossentropy',
-        metrics=['accuracy',
-                 keras.metrics.Precision(),
-                 keras.metrics.Recall(),
-                 keras.metrics.AUC()]
-    )
-
-    return model
-
-
-# Main execution block
-print("Starting Brain Tumor Detection using Graph CNN...")
-
-# Check if saved model exists
-if os.path.exists(model_save_path):
-    print(f"Loading saved model from {model_save_path}")
-    model = load_model(model_save_path, custom_objects={'GCNConv': GCNConv, 'GlobalSumPool': GlobalSumPool})
-    retrain = False
-else:
-    retrain = True
-
-# Process datasets
-if retrain:
-    print("Creating graph datasets from images...")
-    train_graphs, train_labels, _ = create_graph_dataset(train_dir)
-
-    # Create and train the model
-    print("Building and training Graph CNN model...")
-    n_features = train_graphs[0].x.shape[1]
-    model = build_gcnn_model(n_features)
-
-    # Convert to Spektral dataset
-    train_dataset = BrainTumorDataset(train_graphs, train_labels)
-
-    # Prepare data loader for training
-    from spektral.data import BatchLoader
-
-    loader_train = BatchLoader(train_dataset, batch_size=8, shuffle=True)
-
-    # Learning rate scheduler for better convergence
-    lr_scheduler = keras.callbacks.ReduceLROnPlateau(
-        monitor='loss', factor=0.5, patience=2, min_lr=1e-5, verbose=1
-    )
-
-    # Early stopping to prevent overfitting
-    early_stopping = keras.callbacks.EarlyStopping(
-        monitor='val_loss', patience=5, restore_best_weights=True, verbose=1
-    )
-
-    # Train the model
-    history = model.fit(
-        loader_train.load(),
-        steps_per_epoch=loader_train.steps_per_epoch,
-        epochs=10,
-        verbose=1,
-        callbacks=[lr_scheduler]
-    )
-
-    # Save the model
-    model.save(model_save_path)
-    print(f"Model saved to {model_save_path}")
-
-    # Plot training history
-    plt.figure(figsize=(12, 4))
-    plt.subplot(1, 2, 1)
-    plt.plot(history.history['loss'])
-    plt.title('Training Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-
-    plt.subplot(1, 2, 2)
-    plt.plot(history.history['accuracy'])
-    plt.title('Training Accuracy')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
-    plt.tight_layout()
-    plt.show()
-
-# Process test dataset
-print("Processing test dataset...")
-test_graphs, test_labels, test_file_paths = create_graph_dataset(test_dir)
-test_dataset = BrainTumorDataset(test_graphs, test_labels)
-loader_test = spektral.data.BatchLoader(test_dataset, batch_size=1)
-
-# Predict on test set
-print("Making predictions on test dataset...")
-y_pred_probs = []
-
-for batch in loader_test:
-    inputs, _ = batch
-    batch_preds = model.predict(inputs)
-    y_pred_probs.extend(batch_preds.flatten())
-
-y_pred_probs = np.array(y_pred_probs)
-y_pred = (y_pred_probs > 0.5).astype(int)
-
-# Calculate metrics
-accuracy = accuracy_score(test_labels, y_pred)
-precision = precision_score(test_labels, y_pred)
-recall = recall_score(test_labels, y_pred)
-f1 = f1_score(test_labels, y_pred)
-specificity = (np.sum((y_pred == 0) & (test_labels == 0)) /
-               np.sum(test_labels == 0))
-g_mean = np.sqrt(recall * specificity)
-
-# ROC curve and AUC
-fpr, tpr, _ = roc_curve(test_labels, y_pred_probs)
-roc_auc = auc(fpr, tpr)
-
-# Save predictions to CSV
-results_df = pd.DataFrame({
-    'file_path': test_file_paths,
-    'y_true': test_labels,
-    'y_pred': y_pred,
-    'y_pred_prob': y_pred_probs
-})
-results_df.to_csv('brain_tumor_gcnn_predictions.csv', index=False)
-print("Predictions saved to brain_tumor_gcnn_predictions.csv")
-
-# Display metrics
-print("\nBrain Tumor Detection - Graph CNN Model Performance:")
-print(f"Accuracy: {accuracy:.4f}")
-print(f"Precision: {precision:.4f}")
-print(f"Recall (Sensitivity): {recall:.4f}")
-print(f"F1 Score: {f1:.4f}")
-print(f"Specificity: {specificity:.4f}")
-print(f"G-Mean: {g_mean:.4f}")
-print(f"AUC: {roc_auc:.4f}")
-
-# Confusion matrix
-cm = confusion_matrix(test_labels, y_pred)
-print("\nConfusion Matrix:")
-print(cm)
-
-# Visualizations
-# ROC Curve
-plt.figure(figsize=(10, 8))
-plt.plot(fpr, tpr, color='blue', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
-plt.plot([0, 1], [0, 1], color='gray', linestyle='--')
-plt.xlim([0.0, 1.0])
-plt.ylim([0.0, 1.05])
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.title('Receiver Operating Characteristic (ROC) Curve')
-plt.legend(loc="lower right")
-plt.show()
-
-# True vs Predicted Labels
-plt.figure(figsize=(12, 6))
-plt.scatter(range(len(test_labels)), test_labels, label="True Labels", color='blue', marker='o', alpha=0.7)
-plt.scatter(range(len(y_pred)), y_pred, label="Predicted Labels", color='red', marker='x', alpha=0.7)
-plt.xlabel('Sample Index')
-plt.ylabel('Label (0: No Tumor, 1: Tumor)')
-plt.title('True vs Predicted Labels')
-plt.legend()
-plt.grid(True, alpha=0.3)
-plt.show()
-
-# Confusion Matrix Visualization
-plt.figure(figsize=(8, 6))
-classes = ['No Tumor', 'Tumor']
-plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
-plt.title('Confusion Matrix')
-plt.colorbar()
-tick_marks = np.arange(len(classes))
-plt.xticks(tick_marks, classes, rotation=45)
-plt.yticks(tick_marks, classes)
-
-thresh = cm.max() / 2
-for i, j in np.ndindex(cm.shape):
-    plt.text(j, i, format(cm[i, j], 'd'),
-             horizontalalignment="center",
-             color="white" if cm[i, j] > thresh else "black")
-
-plt.tight_layout()
-plt.ylabel('True Label')
-plt.xlabel('Predicted Label')
-plt.show()
-
-
-# Function to visualize the graph construction process for a sample image
-def visualize_graph_construction(image_path):
-    # Load and process the image
-    img = io.imread(image_path)
-    img = tf.image.resize(img, (512, 512)).numpy().astype('uint8')
-
-    # Handle grayscale vs RGB
-    if len(img.shape) == 2:  # Grayscale
-        img_display = np.stack([img, img, img], axis=-1)
-        gray_img = img / 255.0
-    else:  # RGB
-        img_display = img
-        gray_img = color.rgb2gray(img)
-
-    # Create mask to exclude background
-    mask = gray_img > 0.05
-
-    # Apply superpixel segmentation
-    segments = slic(img_display, n_segments=100, compactness=10, start_label=0, mask=mask)
-
-    # Create visualization of the segmentation
-    from skimage.segmentation import mark_boundaries
-    img_with_boundaries = mark_boundaries(img_display, segments)
-
-    # Create a graph representation for visualization (simplified)
-    n_nodes = segments.max() + 1
-
-    # Find centroids of segments for node positions
-    centroids = np.zeros((n_nodes, 2))
-    for i in range(n_nodes):
-        mask = segments == i
-        if mask.sum() > 0:
-            coords = np.column_stack(np.where(mask))
-            centroids[i] = coords.mean(axis=0)
-
-    # Create adjacency using the same approach as in image_to_graph
-    adjacency = np.zeros((n_nodes, n_nodes))
-    dilated_segments = np.copy(segments)
-
-    for i in range(n_nodes):
-        mask = segments == i
-        if mask.sum() > 0:
-            from scipy import ndimage
-            dilated = ndimage.binary_dilation(mask, structure=np.ones((3, 3)))
-            overlapping = np.unique(segments[dilated & ~mask])
-            for j in overlapping:
-                if j != i and j >= 0 and j < n_nodes:
-                    adjacency[i, j] = adjacency[j, i] = 1
-
-    # Visualization
-    plt.figure(figsize=(15, 5))
-
-    plt.subplot(1, 3, 1)
-    plt.imshow(img_display if len(img_display.shape) == 3 else img_display[:, :, 0], cmap='gray')
-    plt.title('Original Image')
-    plt.axis('off')
-
-    plt.subplot(1, 3, 2)
-    plt.imshow(img_with_boundaries)
-    plt.title(f'Superpixel Segmentation\n({n_nodes} segments)')
-    plt.axis('off')
-
-    plt.subplot(1, 3, 3)
-    plt.imshow(img_display if len(img_display.shape) == 3 else img_display[:, :, 0], cmap='gray', alpha=0.7)
-
-    # Draw edges between connected segments
-    for i in range(n_nodes):
-        for j in range(i + 1, n_nodes):
-            if adjacency[i, j] > 0:
-                plt.plot([centroids[i, 1], centroids[j, 1]],
-                         [centroids[i, 0], centroids[j, 0]], 'y-', alpha=0.3, linewidth=0.5)
-
-    # Draw nodes
-    for i in range(n_nodes):
-        plt.plot(centroids[i, 1], centroids[i, 0], 'ro', markersize=3, alpha=0.5)
-
-    plt.title(f'Graph Representation\n({np.sum(adjacency) / 2:.0f} edges)')
-    plt.axis('off')
-
-    plt.tight_layout()
-    plt.show()
-
-
-# Display a random test image with its prediction and graph visualization
-def show_random_prediction_with_graph():
+                    failed += 1
+            print(f"Class {class_name}: Successfully processed {successful} images, Failed on {failed} images")
+    print(f"Total dataset: {len(graph_features)} graphs")
+    return graph_features, graph_adjacency, np.array(labels), file_paths
+
+
+# ---------------------------
+# Visualization: random test image and its graph representation
+def visualize_random_prediction_with_graph(test_file_paths, test_labels, y_pred, y_pred_probs):
     idx = np.random.randint(0, len(test_labels))
     img_path = test_file_paths[idx]
     true_label = test_labels[idx]
     pred_label = y_pred[idx]
     pred_prob = y_pred_probs[idx]
 
-    # Display the original image with prediction
-    img = io.imread(img_path)
-    plt.figure(figsize=(10, 8))
-    plt.imshow(img, cmap='gray' if len(img.shape) == 2 else None)
-    plt.title(f"True: {'Tumor' if true_label == 1 else 'No Tumor'} | "
-              f"Predicted: {'Tumor' if pred_label == 1 else 'No Tumor'} "
-              f"(Prob: {pred_prob:.4f})")
-    plt.axis('off')
-    plt.show()
+    try:
+        img = io.imread(img_path)
+        if len(img.shape) == 3 and img.shape[2] == 4:
+            img = img[:, :, :3]
+        plt.figure(figsize=(15, 5))
+        plt.subplot(1, 3, 1)
+        plt.imshow(img)
+        plt.title(f"Original Image\nTrue: {'Tumor' if true_label == 1 else 'No Tumor'}\n"
+                  f"Pred: {'Tumor' if pred_label == 1 else 'No Tumor'} (Prob: {pred_prob:.2f})")
+        plt.axis('off')
 
-    # Visualize the graph construction process
-    visualize_graph_construction(img_path)
+        node_features, adjacency, segments = image_to_graph(img_path)
+        if segments is None:
+            plt.subplot(1, 3, 2)
+            plt.imshow(img)
+            plt.title("Segmentation failed")
+            plt.axis('off')
+            plt.subplot(1, 3, 3)
+            plt.imshow(img)
+            plt.title("Graph representation unavailable")
+            plt.axis('off')
+        else:
+            from skimage.segmentation import mark_boundaries
+            plt.subplot(1, 3, 2)
+            img_resized = tf.image.resize(img, (512, 512)).numpy().astype('uint8')
+            plt.imshow(mark_boundaries(img_resized, segments))
+            plt.title(f'Superpixel Segmentation\n({segments.max() + 1} segments)')
+            plt.axis('off')
+
+            n_nodes = segments.max() + 1
+            centroids = np.zeros((n_nodes, 2))
+            for i in range(n_nodes):
+                mask_seg = segments == i
+                if mask_seg.sum() > 0:
+                    coords = np.column_stack(np.where(mask_seg))
+                    centroids[i] = coords.mean(axis=0)
+            plt.subplot(1, 3, 3)
+            plt.imshow(img_resized, alpha=0.7)
+            for i in range(n_nodes):
+                for j in range(i + 1, n_nodes):
+                    if adjacency[i, j] > 0:
+                        plt.plot([centroids[i, 1], centroids[j, 1]],
+                                 [centroids[i, 0], centroids[j, 0]], 'y-', alpha=0.3, linewidth=0.5)
+            for i in range(n_nodes):
+                plt.plot(centroids[i, 1], centroids[i, 0], 'ro', markersize=3, alpha=0.5)
+            plt.title(f'Graph Representation\n({int(np.sum(adjacency) / 2)} edges)')
+            plt.axis('off')
+        plt.tight_layout()
+        plt.show()
+    except Exception as e:
+        print(f"Error visualizing {img_path}: {e}")
 
 
-# Show random prediction with graph visualization
-show_random_prediction_with_graph()
+# ---------------------------
+# Main execution block
+print("Starting Brain Tumor Detection using Graph CNN...")
+
+# Define paths
+model_save_path = "brain_tumor_gcnn_model.keras"
+train_dir = r"D:\ED\braintumor\data\Training"
+test_dir = r"D:\ED\braintumor\data\Testing"
+
+# Load saved model if available; else train and save it.
+if os.path.exists(model_save_path):
+    print(f"Loading saved model from {model_save_path}")
+    model = load_model(model_save_path, custom_objects={'SimpleGCN': SimpleGCN})
+    retrain = False
+else:
+    retrain = True
+
+if retrain:
+    print("Creating graph dataset from training images...")
+    train_features, train_adjacency, train_labels, _ = create_graph_dataset(train_dir)
+    n_features = train_features[0].shape[1]
+    print("Building and training Graph CNN model...")
+    model = build_gcnn_model(n_features)
+    history = model.fit(
+        [np.array(train_features), np.array(train_adjacency)],
+        train_labels,
+        epochs=10,
+        batch_size=8,
+        verbose=1
+    )
+    model.save(model_save_path)
+    print(f"Model saved to {model_save_path}")
+else:
+    print("Using loaded model; skipping training.")
+
+print("Processing test dataset...")
+test_features, test_adjacency, test_labels, test_file_paths = create_graph_dataset(test_dir)
+
+print("Making predictions on test dataset...")
+y_pred_probs = []
+for i in range(len(test_features)):
+    x = test_features[i]
+    a = test_adjacency[i]
+    x_batch = np.expand_dims(x, axis=0)
+    a_batch = np.expand_dims(a, axis=0)
+    pred = model.predict([x_batch, a_batch])[0][0]
+    y_pred_probs.append(pred)
+y_pred_probs = np.array(y_pred_probs)
+y_pred = (y_pred_probs > 0.5).astype(int)
+test_labels = np.array(test_labels)
+
+# Save y_test and y_predict in a CSV file with columns "y_test" and "y_predict"
+results_df = pd.DataFrame({
+    "y_test": test_labels,
+    "y_predict": y_pred
+})
+results_df.to_csv("predictions.csv", index=False)
+print("Predictions saved to predictions.csv")
+
+# Compute evaluation metrics
+accuracy = accuracy_score(test_labels, y_pred)
+precision = precision_score(test_labels, y_pred)
+recall = recall_score(test_labels, y_pred)
+f1 = f1_score(test_labels, y_pred)
+fpr, tpr, _ = roc_curve(test_labels, y_pred_probs)
+roc_auc = auc(fpr, tpr)
+cm = confusion_matrix(test_labels, y_pred)
+if cm.size == 4:
+    TN, FP, FN, TP = cm.ravel()
+else:
+    TN, FP, FN, TP = (0, 0, 0, 0)
+specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
+gmean = np.sqrt(recall * specificity)
+
+print("\nEvaluation Metrics:")
+print(f"Accuracy:    {accuracy:.4f}")
+print(f"Precision:   {precision:.4f}")
+print(f"Recall:      {recall:.4f}")
+print(f"F1 Score:    {f1:.4f}")
+print(f"AUC:         {roc_auc:.4f}")
+print(f"Specificity: {specificity:.4f}")
+print(f"G-Mean:      {gmean:.4f}")
+
+# ---------------------------
+# Display interactive plots
+
+# Confusion Matrix
+plt.figure(figsize=(6, 5))
+plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+plt.title("Confusion Matrix")
+plt.colorbar()
+classes = ['No Tumor', 'Tumor']
+tick_marks = np.arange(len(classes))
+plt.xticks(tick_marks, classes, rotation=45)
+plt.yticks(tick_marks, classes)
+thresh = cm.max() / 2.0
+for i, j in np.ndindex(cm.shape):
+    plt.text(j, i, format(cm[i, j], 'd'),
+             horizontalalignment="center",
+             color="white" if cm[i, j] > thresh else "black")
+plt.ylabel('True Label')
+plt.xlabel('Predicted Label')
+plt.tight_layout()
+plt.show()
+
+# ROC Curve
+plt.figure(figsize=(6, 5))
+plt.plot(fpr, tpr, color='blue', lw=2, label=f'ROC curve (AUC = {roc_auc:.4f})')
+plt.plot([0, 1], [0, 1], color='gray', linestyle='--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver Operating Characteristic (ROC) Curve')
+plt.legend(loc="lower right")
+plt.show()
+
+# Scatter Plot: True vs Predicted Labels
+plt.figure(figsize=(8, 5))
+plt.scatter(range(len(test_labels)), test_labels, label="True Labels", color='blue', marker='o', alpha=0.7)
+plt.scatter(range(len(y_pred)), y_pred, label="Predicted Labels", color='red', marker='x', alpha=0.7)
+plt.xlabel("Sample Index")
+plt.ylabel("Label (0: No Tumor, 1: Tumor)")
+plt.title("True vs Predicted Labels")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.show()
+
+# Visualize a random test image with its prediction and graph representation
+visualize_random_prediction_with_graph(test_file_paths, test_labels, y_pred, y_pred_probs)
 
 print("Analysis complete!")
